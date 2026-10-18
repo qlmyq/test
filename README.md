@@ -7,7 +7,7 @@
 一组单文件网页小项目,无需安装任何依赖,用浏览器直接打开即可:
 
 - `index.html`:扫雷
-- `sphere.html`:可拖动旋转的 3D 球体
+- `sphere.html`:可拖动旋转的 3D 星球(程序生成的地表贴图和云层,带一颗环绕飞行的卫星)
 
 ## 扫雷玩法
 
@@ -29,7 +29,7 @@ cd test
 ```
 test/
 ├── index.html   # 扫雷
-├── sphere.html  # 可旋转拖动的 3D 球体
+├── sphere.html  # 带贴图和卫星的 3D 星球
 └── README.md
 ```
 

@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>3D 球体</title>
+<title>3D 星球与卫星</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #0d1117; overflow: hidden; }
+  html, body { margin: 0; height: 100%; background: #05070d; overflow: hidden; }
   body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; color: #c9d1d9; }
-  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
-  canvas.drag { cursor: grabbing; }
+  canvas#c { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas#c.drag { cursor: grabbing; }
   .ui {
     position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
     display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center;
@@ -26,194 +26,476 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hint">拖动旋转 · 滚轮 / 双指缩放 · 松手后带惯性</div>
+<div class="hint">拖动旋转视角 · 滚轮 / 双指缩放 · 松手后带惯性</div>
 <div class="ui">
-  <button id="auto" class="on">自动旋转</button>
-  <button id="grid" class="on">经纬线</button>
-  <button id="dots" class="on">星点</button>
+  <button id="auto" class="on">自转</button>
+  <button id="orbit" class="on">轨道</button>
+  <button id="clouds" class="on">云层</button>
   <button id="reset">重置</button>
 </div>
 
 <script>
 (() => {
+  const PI = Math.PI, TAU = PI * 2;
   const cv = document.getElementById('c');
   const ctx = cv.getContext('2d');
   let W = 0, H = 0, dpr = 1;
 
-  // ---- 状态 ----
-  const ident = () => [1,0,0, 0,1,0, 0,0,1];
-  let R = rotX(-0.35);          // 当前旋转矩阵(行主序 3x3)
-  let zoom = 1;
-  let vx = 0, vy = 0;           // 惯性角速度
-  let autoSpin = true, showGrid = true, showDots = true;
-  let dragging = false, lastX = 0, lastY = 0;
-  const pointers = new Map();
-  let pinchDist = 0;
+  // =====================================================================
+  //  程序生成地表贴图(无需外部图片):3D 噪声 → 等距柱状投影贴图
+  // =====================================================================
+  const TW = 768, TH = 384;
+  const tex = new Uint8ClampedArray(TW * TH * 4);   // r, g, b, 水面标记(255 = 海洋)
+  const cloudMap = new Uint8Array(TW * TH);  // 云量 0-255
 
-  // ---- 矩阵工具 ----
+  const SEED = 1337;
+  function hash3(x, y, z) {
+    let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(z, 1440670441) ^ SEED;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+  }
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  function noise3(x, y, z) {
+    const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+    const u = fade(x - xi), v = fade(y - yi), w = fade(z - zi);
+    const a = lerp(hash3(xi, yi, zi),         hash3(xi + 1, yi, zi),         u);
+    const b = lerp(hash3(xi, yi + 1, zi),     hash3(xi + 1, yi + 1, zi),     u);
+    const c = lerp(hash3(xi, yi, zi + 1),     hash3(xi + 1, yi, zi + 1),     u);
+    const d = lerp(hash3(xi, yi + 1, zi + 1), hash3(xi + 1, yi + 1, zi + 1), u);
+    return lerp(lerp(a, b, v), lerp(c, d, v), w);
+  }
+  function fbm(x, y, z, oct) {
+    let s = 0, a = 0.5, f = 1, n = 0;
+    for (let i = 0; i < oct; i++) {
+      s += a * noise3(x * f + i * 31.7, y * f + i * 17.3, z * f + i * 9.1);
+      n += a; a *= 0.5; f *= 2.02;
+    }
+    return s / n;
+  }
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+  const mix3 = (A, B, t) => [lerp(A[0], B[0], t), lerp(A[1], B[1], t), lerp(A[2], B[2], t)];
+
+  function generatePlanet() {
+    const N = TW * TH;
+    const heights = new Float32Array(N);
+    let hmax = 0;
+
+    // 第一遍:高度场
+    for (let y = 0; y < TH; y++) {
+      const lat = (0.5 - (y + 0.5) / TH) * PI, cl = Math.cos(lat), py = Math.sin(lat);
+      for (let x = 0; x < TW; x++) {
+        const lon = ((x + 0.5) / TW - 0.5) * TAU;
+        const h = fbm(cl * Math.cos(lon) * 1.6 + 11.3, py * 1.6 + 4.7, cl * Math.sin(lon) * 1.6 + 7.9, 6);
+        heights[y * TW + x] = h;
+        if (h > hmax) hmax = h;
+      }
+    }
+    // 取 66% 分位作为海平面(约三分之二是海洋)
+    const sorted = Float32Array.from(heights).sort();
+    const sea = sorted[Math.floor(N * 0.66)];
+
+    const DEEP = [6, 26, 70], SHALLOW = [34, 128, 176], SAND = [216, 198, 142];
+    const DESERT = [206, 172, 104], GRASS = [88, 140, 62], FOREST = [34, 92, 50];
+    const TUNDRA = [150, 152, 132], ROCK = [124, 114, 106], SNOW = [242, 246, 250], ICE = [226, 236, 246];
+
+    for (let y = 0; y < TH; y++) {
+      const lat = (0.5 - (y + 0.5) / TH) * PI, cl = Math.cos(lat), py = Math.sin(lat);
+      for (let x = 0; x < TW; x++) {
+        const lon = ((x + 0.5) / TW - 0.5) * TAU;
+        const px = cl * Math.cos(lon), pz = cl * Math.sin(lon);
+        const i = y * TW + x, h = heights[i];
+        const absLat = Math.abs(py);
+        const polar = smooth(0.80, 0.90, absLat + (noise3(px * 5, py * 5, pz * 5) - 0.5) * 0.12);
+        let col, water = 0;
+
+        if (h < sea) {
+          // 海洋:越深越暗,近岸偏青绿
+          const depth = clamp((sea - h) / (sea - sorted[0] + 1e-6), 0, 1);
+          col = mix3(SHALLOW, DEEP, smooth(0.0, 0.55, depth));
+          col = mix3(col, ICE, polar);
+          water = polar > 0.6 ? 0 : 255;
+        } else {
+          const t = clamp((h - sea) / (hmax - sea), 0, 1);
+          const m = clamp((fbm(px * 2.3 + 3.1, py * 2.3 + 8.4, pz * 2.3 + 1.7, 4) - 0.5) * 2.4 + 0.5, 0, 1);
+          // 低地:沙漠 → 草地 → 森林
+          let low = mix3(DESERT, mix3(GRASS, FOREST, smooth(0.55, 0.8, m)), smooth(0.38, 0.58, m));
+          low = mix3(low, TUNDRA, smooth(0.62, 0.82, absLat));
+          col = mix3(SAND, low, smooth(0.0, 0.05, t));
+          col = mix3(col, ROCK, smooth(0.42, 0.62, t));
+          col = mix3(col, SNOW, Math.max(smooth(0.68, 0.85, t), smooth(0.55, 0.65, absLat) * smooth(0.25, 0.5, t)));
+          col = mix3(col, SNOW, polar);
+        }
+        // 细节明暗
+        const fine = 0.9 + 0.2 * noise3(px * 14 + 2, py * 14 + 5, pz * 14 + 9);
+        const o = i * 4;
+        tex[o] = col[0] * fine; tex[o + 1] = col[1] * fine; tex[o + 2] = col[2] * fine; tex[o + 3] = water;
+
+        // 云层
+        const c = clamp((fbm(px * 2.4 + 5.5, py * 2.9 + 1.2, pz * 2.4 + 9.3, 5) - 0.5) * 2.5 + 0.5, 0, 1);
+        cloudMap[i] = 235 * smooth(0.6, 0.88, c);
+      }
+    }
+  }
+  generatePlanet();
+
+  // =====================================================================
+  //  矩阵工具(行主序 3x3)
+  // =====================================================================
   function rotX(a) { const c = Math.cos(a), s = Math.sin(a); return [1,0,0, 0,c,-s, 0,s,c]; }
   function rotY(a) { const c = Math.cos(a), s = Math.sin(a); return [c,0,s, 0,1,0, -s,0,c]; }
+  function rotZ(a) { const c = Math.cos(a), s = Math.sin(a); return [c,-s,0, s,c,0, 0,0,1]; }
   function mul(A, B) {
     const o = new Array(9);
     for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++)
       o[r*3+c] = A[r*3]*B[c] + A[r*3+1]*B[3+c] + A[r*3+2]*B[6+c];
     return o;
   }
-  // 每隔一段时间做一次正交化,避免累积误差
+  const transpose = M => [M[0],M[3],M[6], M[1],M[4],M[7], M[2],M[5],M[8]];
+  const apply = (M, v) => [M[0]*v[0]+M[1]*v[1]+M[2]*v[2], M[3]*v[0]+M[4]*v[1]+M[5]*v[2], M[6]*v[0]+M[7]*v[1]+M[8]*v[2]];
+  const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+  const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+  const norm = v => { const n = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/n, v[1]/n, v[2]/n]; };
   function orthonormalize(M) {
-    let [a,b,c, d,e,f, g,h,i] = M;
+    let [a,b,c, d,e,f] = M;
     let n = Math.hypot(a,b,c); a/=n; b/=n; c/=n;
-    let dot = a*d+b*e+c*f; d-=dot*a; e-=dot*b; f-=dot*c;
+    const k = a*d+b*e+c*f; d-=k*a; e-=k*b; f-=k*c;
     n = Math.hypot(d,e,f); d/=n; e/=n; f/=n;
-    g = b*f - c*e; h = c*d - a*f; i = a*e - b*d;
-    return [a,b,c, d,e,f, g,h,i];
+    return [a,b,c, d,e,f, b*f-c*e, c*d-a*f, a*e-b*d];
   }
 
-  // ---- 几何数据 ----
-  const grid = [];   // 线段 [x1,y1,z1,x2,y2,z2,kind]
-  const stars = [];  // 点 [x,y,z]
-  (function build() {
-    const MER = 16, PAR = 11, SEG = 72;
-    for (let m = 0; m < MER; m++) {
-      const lon = m / MER * Math.PI * 2;
-      for (let s = 0; s < SEG; s++) {
-        const a = -Math.PI/2 + s / SEG * Math.PI, b = -Math.PI/2 + (s+1) / SEG * Math.PI;
-        grid.push([...sph(a, lon), ...sph(b, lon), 0]);
+  // =====================================================================
+  //  状态
+  // =====================================================================
+  const VIEW0 = rotX(-0.35);
+  let R = VIEW0.slice();          // 视角旋转(拖动改变)
+  let zoom = 1;
+  let vx = 0, vy = 0;             // 惯性
+  let autoSpin = true, showOrbit = true, showClouds = true;
+  let spin = 0, cloudShift = 0, satT = 0.6;
+  let dragging = false, lastX = 0, lastY = 0;
+  const pointers = new Map();
+  let pinchDist = 0;
+
+  const TILT = 0.41;                              // 地轴倾角
+  const L = norm([-0.5, 0.45, 0.75]);             // 太阳方向(视图空间,固定)
+  const Hh = norm([L[0], L[1], L[2] + 1]);        // 高光半程向量
+
+  // 卫星轨道(场景空间)
+  const ORBIT_R = 1.55;
+  const O = mul(rotY(0.5), rotX(1.05));
+  const E1 = apply(O, [1, 0, 0]), E2 = apply(O, [0, 0, 1]);
+  const ORBIT_N = norm(cross(E1, E2));
+
+  // =====================================================================
+  //  球体光栅化(逐像素射线求交 + 贴图采样)
+  // =====================================================================
+  let S = 0, count = 0, rpx = 0;
+  let pidx, pnx, pny, pnz, plight, pspec, prim, palpha;
+  let off, offCtx, img, imgData;
+
+  function setupRender(r) {
+    rpx = r;
+    S = Math.ceil(r * 2) + 4;
+    const max = S * S;
+    pidx = new Int32Array(max); pnx = new Float32Array(max); pny = new Float32Array(max); pnz = new Float32Array(max);
+    plight = new Float32Array(max); pspec = new Float32Array(max); prim = new Float32Array(max); palpha = new Float32Array(max);
+    off = document.createElement('canvas'); off.width = off.height = S;
+    offCtx = off.getContext('2d');
+    img = offCtx.createImageData(S, S);
+    imgData = img.data;
+    const c = S / 2;
+    count = 0;
+    for (let py = 0; py < S; py++) {
+      for (let px = 0; px < S; px++) {
+        let x = (px + 0.5 - c) / r, y = -(py + 0.5 - c) / r;
+        const rr = Math.hypot(x, y);
+        const a = clamp((1 - rr) * r + 0.5, 0, 1);
+        if (a <= 0) continue;
+        let z;
+        if (rr > 1) { x /= rr; y /= rr; z = 0; } else z = Math.sqrt(1 - rr * rr);
+        const nL = x * L[0] + y * L[1] + z * L[2];
+        const nH = Math.max(0, x * Hh[0] + y * Hh[1] + z * Hh[2]);
+        const k = count++;
+        pidx[k] = (py * S + px) * 4;
+        pnx[k] = x; pny[k] = y; pnz[k] = z;
+        plight[k] = 0.05 + 0.95 * Math.pow(Math.max(0, nL), 0.75);
+        pspec[k] = Math.pow(nH, 48);
+        prim[k] = Math.pow(1 - z, 3) * (0.25 + 0.75 * clamp(nL + 0.35, 0, 1));
+        palpha[k] = a * 255;
       }
     }
-    for (let p = 1; p <= PAR; p++) {
-      const lat = -Math.PI/2 + p / (PAR + 1) * Math.PI;
-      const kind = p === (PAR + 1) / 2 ? 1 : 0;   // 赤道加亮
-      for (let s = 0; s < SEG * 2; s++) {
-        const a = s / (SEG*2) * Math.PI * 2, b = (s+1) / (SEG*2) * Math.PI * 2;
-        grid.push([...sph(lat, a), ...sph(lat, b), kind]);
+  }
+
+  const INV_TAU = 1 / TAU, INV_PI = 1 / PI;
+  function renderPlanet(M) {
+    const d = imgData, tx = tex, cm = cloudMap;
+    const m0 = M[0], m1 = M[1], m2 = M[2], m3 = M[3], m4 = M[4], m5 = M[5], m6 = M[6], m7 = M[7], m8 = M[8];
+    const cs = cloudShift * TW, withClouds = showClouds;
+    for (let k = 0; k < count; k++) {
+      const nx = pnx[k], ny = pny[k], nz = pnz[k];
+      const dx = m0*nx + m1*ny + m2*nz;
+      let dy = m3*nx + m4*ny + m5*nz;
+      const dz = m6*nx + m7*ny + m8*nz;
+      dy = dy < -1 ? -1 : dy > 1 ? 1 : dy;
+      const lat = Math.asin(dy), lon = Math.atan2(dz, dx);
+      const fu = (lon * INV_TAU + 0.5) * TW - 0.5;
+      const fv = (0.5 - lat * INV_PI) * TH - 0.5;
+
+      let x0 = Math.floor(fu); const fx = fu - x0;
+      let y0 = Math.floor(fv); const fy = fv - y0;
+      let x1 = x0 + 1; if (x0 < 0) x0 += TW; if (x1 >= TW) x1 -= TW; if (x0 >= TW) x0 -= TW;
+      let y1 = y0 + 1; if (y0 < 0) y0 = 0; if (y1 > TH - 1) y1 = TH - 1; if (y0 > TH - 1) y0 = TH - 1;
+      const w00 = (1-fx)*(1-fy), w10 = fx*(1-fy), w01 = (1-fx)*fy, w11 = fx*fy;
+      const i00 = (y0*TW + x0) * 4, i10 = (y0*TW + x1) * 4, i01 = (y1*TW + x0) * 4, i11 = (y1*TW + x1) * 4;
+      let r = tx[i00]*w00 + tx[i10]*w10 + tx[i01]*w01 + tx[i11]*w11;
+      let g = tx[i00+1]*w00 + tx[i10+1]*w10 + tx[i01+1]*w01 + tx[i11+1]*w11;
+      let b = tx[i00+2]*w00 + tx[i10+2]*w10 + tx[i01+2]*w01 + tx[i11+2]*w11;
+      const water = (tx[i00+3]*w00 + tx[i10+3]*w10 + tx[i01+3]*w01 + tx[i11+3]*w11) * (1 / 255);
+
+      let cl = 0;
+      if (withClouds) {
+        const fuc = fu + cs;
+        let c0 = Math.floor(fuc); const cfx = fuc - c0;
+        let c1 = c0 + 1;
+        c0 = ((c0 % TW) + TW) % TW; c1 = ((c1 % TW) + TW) % TW;
+        const a0 = cm[y0*TW + c0] * (1 - cfx) + cm[y0*TW + c1] * cfx;
+        const a1 = cm[y1*TW + c0] * (1 - cfx) + cm[y1*TW + c1] * cfx;
+        cl = (a0 * (1 - fy) + a1 * fy) * (1 / 255);
+        r += (246 - r) * cl; g += (248 - g) * cl; b += (252 - b) * cl;
+      }
+
+      const light = plight[k], rim = prim[k];
+      const sp = pspec[k] * water * (1 - cl) * 150;
+      const o = pidx[k];
+      d[o]     = r * light + sp + rim * 70;
+      d[o + 1] = g * light + sp + rim * 130;
+      d[o + 2] = b * light + sp + rim * 255 * 0.9;
+      d[o + 3] = palpha[k];
+    }
+    offCtx.putImageData(img, 0, 0);
+  }
+
+  // =====================================================================
+  //  背景星空
+  // =====================================================================
+  let starCv = null;
+  function buildStars() {
+    starCv = document.createElement('canvas');
+    starCv.width = Math.max(1, Math.floor(W * dpr)); starCv.height = Math.max(1, Math.floor(H * dpr));
+    const sc = starCv.getContext('2d');
+    let s = 987654321;
+    const rnd = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296;
+    const n = Math.floor(W * H / 5000);
+    for (let i = 0; i < n; i++) {
+      const a = 0.25 + rnd() * 0.6, r = rnd() < 0.08 ? 1.6 : 0.8;
+      sc.fillStyle = `rgba(210,225,255,${a})`;
+      sc.fillRect(rnd() * starCv.width, rnd() * starCv.height, r * dpr, r * dpr);
+    }
+  }
+
+  // =====================================================================
+  //  卫星
+  // =====================================================================
+  const BODY = { hx: 0.05, hy: 0.036, hz: 0.04 };
+  const CUBE_V = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]];
+  const CUBE_F = [
+    { i: [0,3,2,1], n: [0,0,-1] }, { i: [4,5,6,7], n: [0,0,1] },
+    { i: [0,1,5,4], n: [0,-1,0] }, { i: [3,7,6,2], n: [0,1,0] },
+    { i: [0,4,7,3], n: [-1,0,0] }, { i: [1,2,6,5], n: [1,0,0] },
+  ];
+  const SAT_SCALE = 1.35;
+
+  function drawSatellite(cx, cy, rad, time) {
+    const ang = satT;
+    const rHat = [Math.cos(ang) * E1[0] + Math.sin(ang) * E2[0], Math.cos(ang) * E1[1] + Math.sin(ang) * E2[1], Math.cos(ang) * E1[2] + Math.sin(ang) * E2[2]];
+    const vHat = [-Math.sin(ang) * E1[0] + Math.cos(ang) * E2[0], -Math.sin(ang) * E1[1] + Math.cos(ang) * E2[1], -Math.sin(ang) * E1[2] + Math.cos(ang) * E2[2]];
+    const nHat = ORBIT_N;
+
+    // 视图空间基向量与中心
+    const rv = apply(R, vHat), rr = apply(R, rHat), rn = apply(R, nHat);
+    const C = apply(R, [rHat[0] * ORBIT_R, rHat[1] * ORBIT_R, rHat[2] * ORBIT_R]);
+
+    // 是否处在行星阴影中(圆柱阴影)
+    const along = dot(C, L);
+    const perp = Math.hypot(C[0] - along * L[0], C[1] - along * L[1], C[2] - along * L[2]);
+    const shadow = along < 0 && perp < 1.0;
+    const amb = shadow ? 0.1 : 0.3, gain = shadow ? 0.0 : 0.85;
+
+    const P = (lx, ly, lz) => {
+      const x = C[0] + (lx * rv[0] + ly * rr[0] + lz * rn[0]) * SAT_SCALE;
+      const y = C[1] + (lx * rv[1] + ly * rr[1] + lz * rn[1]) * SAT_SCALE;
+      const z = C[2] + (lx * rv[2] + ly * rr[2] + lz * rn[2]) * SAT_SCALE;
+      return [cx + x * rad, cy - y * rad, z];
+    };
+    const nView = n => [n[0]*rv[0] + n[1]*rr[0] + n[2]*rn[0], n[0]*rv[1] + n[1]*rr[1] + n[2]*rn[1], n[0]*rv[2] + n[1]*rr[2] + n[2]*rn[2]];
+
+    const items = [];
+    const { hx, hy, hz } = BODY;
+
+    // 机身
+    for (const f of CUBE_F) {
+      const nv = nView(f.n);
+      if (nv[2] <= 0.02) continue;
+      const pts = f.i.map(k => P(CUBE_V[k][0] * hx, CUBE_V[k][1] * hy, CUBE_V[k][2] * hz));
+      const lit = amb + gain * Math.max(0, dot(nv, L));
+      items.push({ pts, z: pts.reduce((s, p) => s + p[2], 0) / 4, fill: [226 * lit, 188 * lit, 100 * lit], stroke: 'rgba(60,40,10,.6)' });
+    }
+    // 太阳能板(双面)与支臂
+    const panelNv = nView([0, 1, 0]);
+    const panelLit = amb + gain * Math.abs(dot(panelNv, L));
+    for (const s of [-1, 1]) {
+      const z0 = hz + 0.035, z1 = 0.24, wx = 0.055;
+      const q = [P(-wx, 0, s * z0), P(wx, 0, s * z0), P(wx, 0, s * z1), P(-wx, 0, s * z1)];
+      items.push({ boom: [P(0, 0, s * hz), P(0, 0, s * z0)], z: (q[0][2] + q[2][2]) / 2 - 0.001 });
+      items.push({ pts: q, z: (q[0][2] + q[2][2]) / 2, fill: [30 * panelLit + 8, 58 * panelLit + 10, 140 * panelLit + 20], stroke: 'rgba(190,215,255,.85)', grid: true });
+    }
+    items.sort((a, b) => a.z - b.z);
+
+    for (const it of items) {
+      if (it.boom) {
+        ctx.strokeStyle = 'rgba(200,200,210,.9)'; ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.moveTo(it.boom[0][0], it.boom[0][1]); ctx.lineTo(it.boom[1][0], it.boom[1][1]); ctx.stroke();
+        continue;
+      }
+      const p = it.pts;
+      ctx.fillStyle = `rgb(${it.fill[0] | 0},${it.fill[1] | 0},${it.fill[2] | 0})`;
+      ctx.beginPath(); ctx.moveTo(p[0][0], p[0][1]);
+      for (let i = 1; i < p.length; i++) ctx.lineTo(p[i][0], p[i][1]);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = it.stroke; ctx.lineWidth = 1; ctx.stroke();
+      if (it.grid) {
+        ctx.strokeStyle = 'rgba(190,215,255,.45)'; ctx.lineWidth = 0.7;
+        ctx.beginPath();
+        for (let k = 1; k < 4; k++) {   // 沿长边分割
+          const t = k / 4;
+          ctx.moveTo(lerp(p[0][0], p[3][0], t), lerp(p[0][1], p[3][1], t));
+          ctx.lineTo(lerp(p[1][0], p[2][0], t), lerp(p[1][1], p[2][1], t));
+        }
+        ctx.moveTo((p[0][0] + p[1][0]) / 2, (p[0][1] + p[1][1]) / 2);
+        ctx.lineTo((p[2][0] + p[3][0]) / 2, (p[2][1] + p[3][1]) / 2);
+        ctx.stroke();
       }
     }
-    // 斐波那契球面均匀点
-    const N = 700, ga = Math.PI * (3 - Math.sqrt(5));
-    for (let k = 0; k < N; k++) {
-      const y = 1 - (k + .5) / N * 2, r = Math.sqrt(1 - y*y), t = k * ga;
-      stars.push([Math.cos(t) * r, y, Math.sin(t) * r]);
+
+    // 天线(朝向行星)与闪烁指示灯
+    const a0 = P(0, -hy, 0), a1 = P(0, -hy - 0.07, 0);
+    ctx.strokeStyle = 'rgba(210,210,220,.9)'; ctx.lineWidth = 1.3;
+    ctx.beginPath(); ctx.moveTo(a0[0], a0[1]); ctx.lineTo(a1[0], a1[1]); ctx.stroke();
+    ctx.fillStyle = '#e8e8f0';
+    ctx.beginPath(); ctx.arc(a1[0], a1[1], 2.6, 0, TAU); ctx.fill();
+    const led = P(0, hy, 0);
+    const blink = (Math.sin(time * 0.006) > 0.55) ? 1 : 0.15;
+    ctx.fillStyle = `rgba(255,70,60,${blink})`;
+    ctx.beginPath(); ctx.arc(led[0], led[1], 2.2, 0, TAU); ctx.fill();
+    return C;
+  }
+
+  // 轨道线(带拖尾):back = true 绘制行星背后的部分
+  function drawOrbit(cx, cy, rad) {
+    const SEG = 180;
+    const pts = [];
+    for (let j = 0; j <= SEG; j++) {
+      const t = j / SEG * TAU;
+      const v = apply(R, [ORBIT_R * (Math.cos(t) * E1[0] + Math.sin(t) * E2[0]),
+                          ORBIT_R * (Math.cos(t) * E1[1] + Math.sin(t) * E2[1]),
+                          ORBIT_R * (Math.cos(t) * E1[2] + Math.sin(t) * E2[2])]);
+      pts.push({ x: cx + v[0] * rad, y: cy - v[1] * rad, z: v[2], t });
     }
-  })();
-  function sph(lat, lon) {
-    const c = Math.cos(lat);
-    return [c * Math.cos(lon), Math.sin(lat), c * Math.sin(lon)];
+    ctx.lineCap = 'round'; ctx.lineWidth = 1.3;
+    for (const front of [false, true]) {
+      ctx.save();
+      if (!front) {   // 背面部分:裁掉行星圆盘
+        ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.arc(cx, cy, rad, 0, TAU, true); ctx.clip('evenodd');
+      }
+      for (let j = 0; j < SEG; j++) {
+        const a = pts[j], b = pts[j + 1];
+        if ((a.z + b.z) / 2 >= 0 !== front) continue;
+        const behind = (((satT - (a.t + b.t) / 2) % TAU) + TAU) % TAU;   // 落后卫星的角度
+        const trail = Math.exp(-behind * 2.0);
+        ctx.strokeStyle = `rgba(140,200,255,${0.1 + 0.65 * trail})`;
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      }
+      ctx.restore();
+    }
   }
-  const POLES = [[0,1,0,'#ff6b6b'], [0,-1,0,'#4dabf7']];
 
-  // ---- 投影 ----
-  const CAM = 3.2;
-  function project(x, y, z, rad, cx, cy) {
-    const t = rad * (CAM / (CAM - z)) ;
-    return [cx + x * t, cy - y * t, z];
-  }
-  function xf(x, y, z) {
-    return [R[0]*x + R[1]*y + R[2]*z, R[3]*x + R[4]*y + R[5]*z, R[6]*x + R[7]*y + R[8]*z];
-  }
-
-  // ---- 绘制 ----
+  // =====================================================================
+  //  主绘制
+  // =====================================================================
   function resize() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = window.innerWidth; H = window.innerHeight;
     cv.width = W * dpr; cv.height = H * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    buildStars();
   }
 
-  function draw() {
+  function draw(time) {
     ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(starCv, 0, 0, W, H);
     const cx = W / 2, cy = H / 2 - 10;
-    const rad = Math.min(W, H) * 0.3 * zoom;
+    const rad = Math.min(W, H) * 0.27 * zoom;
 
-    // 光晕
-    const glow = ctx.createRadialGradient(cx, cy, rad * .6, cx, cy, rad * 1.9);
-    glow.addColorStop(0, 'rgba(47,129,247,.22)');
-    glow.addColorStop(1, 'rgba(47,129,247,0)');
+    // 大气外晕
+    const glow = ctx.createRadialGradient(cx, cy, rad * 0.96, cx, cy, rad * 1.28);
+    glow.addColorStop(0, 'rgba(90,160,255,.38)');
+    glow.addColorStop(1, 'rgba(90,160,255,0)');
     ctx.fillStyle = glow; ctx.fillRect(0, 0, W, H);
 
-    // 球体底色(带高光,随视角固定光源)
-    const body = ctx.createRadialGradient(cx - rad*.35, cy - rad*.4, rad*.1, cx, cy, rad * 1.02);
-    body.addColorStop(0, '#26364f');
-    body.addColorStop(.6, '#131c2b');
-    body.addColorStop(1, '#0a0f18');
-    ctx.fillStyle = body;
-    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill();
+    // 球体
+    const want = clamp(Math.round(rad * dpr), 60, 190);
+    if (want !== rpx) setupRender(want);
+    const Rp = mul(R, mul(rotZ(TILT), rotY(spin)));
+    renderPlanet(transpose(Rp));
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    const size = S * (rad / rpx);
+    ctx.drawImage(off, cx - size / 2, cy - size / 2, size, size);
 
-    const items = [];
-
-    if (showGrid) {
-      for (const g of grid) {
-        const a = xf(g[0], g[1], g[2]), b = xf(g[3], g[4], g[5]);
-        items.push({ t: 0, z: (a[2] + b[2]) / 2, a, b, kind: g[6] });
-      }
-    }
-    if (showDots) {
-      for (const s of stars) {
-        const p = xf(s[0] * 1.0, s[1], s[2]);
-        items.push({ t: 1, z: p[2], a: p });
-      }
-    }
-    for (const p of POLES) {
-      const q = xf(p[0] * 1.08, p[1] * 1.08, p[2] * 1.08);
-      items.push({ t: 2, z: q[2], a: q, color: p[3] });
-    }
-    items.sort((u, v) => u.z - v.z);
-
-    ctx.lineCap = 'round';
-    for (const it of items) {
-      const depth = (it.z + 1) / 2;            // 0(后) → 1(前)
-      if (it.t === 0) {
-        const p = project(...it.a, rad, cx, cy), q = project(...it.b, rad, cx, cy);
-        const alpha = it.z > -0.02 ? 0.25 + depth * 0.6 : 0.05 + depth * 0.18;
-        ctx.strokeStyle = it.kind
-          ? `rgba(255,196,87,${Math.min(1, alpha + .15)})`
-          : `rgba(120,180,255,${alpha})`;
-        ctx.lineWidth = it.kind ? 1.6 : (it.z > 0 ? 1.1 : 0.7);
-        ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
-      } else if (it.t === 1) {
-        const p = project(...it.a, rad, cx, cy);
-        const front = it.z > 0;
-        ctx.fillStyle = front ? `rgba(255,255,255,${0.3 + depth * 0.7})` : `rgba(160,200,255,${0.08 + depth * 0.2})`;
-        const r = (front ? 1.2 : 0.8) + depth * 1.3;
-        ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, Math.PI * 2); ctx.fill();
-      } else {
-        const p = project(...it.a, rad, cx, cy);
-        ctx.globalAlpha = it.z > 0 ? 1 : 0.35;
-        ctx.fillStyle = it.color;
-        ctx.beginPath(); ctx.arc(p[0], p[1], 5 + depth * 3, 0, Math.PI * 2); ctx.fill();
-        ctx.globalAlpha = 1;
-      }
-    }
-
-    // 边缘轮廓
-    ctx.strokeStyle = 'rgba(140,190,255,.45)'; ctx.lineWidth = 1.2;
-    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.stroke();
+    // 轨道与卫星
+    if (showOrbit) drawOrbit(cx, cy, rad);
+    const sx = rad;
+    // 卫星位置用于判断遮挡
+    const Cz = apply(R, [ORBIT_R * (Math.cos(satT) * E1[0] + Math.sin(satT) * E2[0]),
+                         ORBIT_R * (Math.cos(satT) * E1[1] + Math.sin(satT) * E2[1]),
+                         ORBIT_R * (Math.cos(satT) * E1[2] + Math.sin(satT) * E2[2])])[2];
+    ctx.save();
+    if (Cz < 0) { ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.arc(cx, cy, rad, 0, TAU, true); ctx.clip('evenodd'); }
+    drawSatellite(cx, cy, sx, time);
+    ctx.restore();
   }
 
-  // ---- 动画循环 ----
-  let frame = 0;
-  function tick() {
+  // =====================================================================
+  //  动画循环
+  // =====================================================================
+  let frame = 0, prev = 0;
+  function tick(now) {
+    const dt = prev ? Math.min(0.05, (now - prev) / 1000) : 0.016;
+    prev = now;
     if (!dragging) {
       if (Math.abs(vx) > 1e-4 || Math.abs(vy) > 1e-4) {
         R = mul(mul(rotX(vy), rotY(vx)), R);
         vx *= 0.95; vy *= 0.95;
-      } else if (autoSpin) {
-        R = mul(rotY(0.005), R);
       }
     }
+    if (autoSpin) { spin += 0.18 * dt; cloudShift += 0.004 * dt; }
+    satT = (satT + 0.55 * dt) % TAU;
     if (++frame % 120 === 0) R = orthonormalize(R);
-    draw();
+    draw(now);
     requestAnimationFrame(tick);
   }
 
-  // ---- 交互 ----
-  const K = 0.0065;   // 像素 → 弧度
+  // =====================================================================
+  //  交互
+  // =====================================================================
+  const K = 0.0065;
   function applyDrag(dx, dy) {
     const ry = dx * K, rx = dy * K;
     R = mul(mul(rotX(rx), rotY(ry)), R);
     vx = ry; vy = rx;
   }
-
   cv.addEventListener('pointerdown', e => {
     cv.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, [e.clientX, e.clientY]);
@@ -222,7 +504,7 @@
       cv.classList.add('drag');
     } else if (pointers.size === 2) {
       const [a, b] = [...pointers.values()];
-      pinchDist = Math.hypot(a[0]-b[0], a[1]-b[1]);
+      pinchDist = Math.hypot(a[0] - b[0], a[1] - b[1]);
       dragging = false;
     }
   });
@@ -231,8 +513,8 @@
     pointers.set(e.pointerId, [e.clientX, e.clientY]);
     if (pointers.size === 2) {
       const [a, b] = [...pointers.values()];
-      const d = Math.hypot(a[0]-b[0], a[1]-b[1]);
-      if (pinchDist) zoom = clamp(zoom * d / pinchDist, .4, 2.6);
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      if (pinchDist) zoom = clamp(zoom * d / pinchDist, 0.45, 2.2);
       pinchDist = d;
     } else if (dragging) {
       applyDrag(e.clientX - lastX, e.clientY - lastY);
@@ -251,23 +533,19 @@
   cv.addEventListener('pointercancel', end);
   cv.addEventListener('wheel', e => {
     e.preventDefault();
-    zoom = clamp(zoom * Math.exp(-e.deltaY * 0.0012), .4, 2.6);
+    zoom = clamp(zoom * Math.exp(-e.deltaY * 0.0012), 0.45, 2.2);
   }, { passive: false });
-  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
-  // ---- 按钮 ----
   const bind = (id, fn) => document.getElementById(id).addEventListener('click', fn);
-  const toggle = (id, get, set) => bind(id, e => {
-    set(!get()); e.currentTarget.classList.toggle('on', get());
-  });
+  const toggle = (id, get, set) => bind(id, e => { set(!get()); e.currentTarget.classList.toggle('on', get()); });
   toggle('auto', () => autoSpin, v => autoSpin = v);
-  toggle('grid', () => showGrid, v => showGrid = v);
-  toggle('dots', () => showDots, v => showDots = v);
-  bind('reset', () => { R = rotX(-0.35); zoom = 1; vx = vy = 0; });
+  toggle('orbit', () => showOrbit, v => showOrbit = v);
+  toggle('clouds', () => showClouds, v => showClouds = v);
+  bind('reset', () => { R = VIEW0.slice(); zoom = 1; vx = vy = 0; });
 
   window.addEventListener('resize', resize);
   resize();
-  tick();
+  requestAnimationFrame(tick);
 })();
 </script>
 </body>
