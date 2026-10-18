@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>3D 球体</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1117; overflow: hidden; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; color: #c9d1d9; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas.drag { cursor: grabbing; }
+  .ui {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center;
+    padding: 8px 12px; border-radius: 999px; background: rgba(255,255,255,.07);
+    backdrop-filter: blur(8px); font-size: 13px;
+  }
+  .ui button {
+    font: inherit; color: inherit; background: rgba(255,255,255,.1); border: 0;
+    border-radius: 999px; padding: 6px 14px; cursor: pointer;
+  }
+  .ui button:hover { background: rgba(255,255,255,.2); }
+  .ui button.on { background: #2f81f7; color: #fff; }
+  .hint { position: fixed; top: 16px; left: 0; right: 0; text-align: center; font-size: 13px; opacity: .6; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hint">拖动旋转 · 滚轮 / 双指缩放 · 松手后带惯性</div>
+<div class="ui">
+  <button id="auto" class="on">自动旋转</button>
+  <button id="grid" class="on">经纬线</button>
+  <button id="dots" class="on">星点</button>
+  <button id="reset">重置</button>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  let W = 0, H = 0, dpr = 1;
+
+  // ---- 状态 ----
+  const ident = () => [1,0,0, 0,1,0, 0,0,1];
+  let R = rotX(-0.35);          // 当前旋转矩阵(行主序 3x3)
+  let zoom = 1;
+  let vx = 0, vy = 0;           // 惯性角速度
+  let autoSpin = true, showGrid = true, showDots = true;
+  let dragging = false, lastX = 0, lastY = 0;
+  const pointers = new Map();
+  let pinchDist = 0;
+
+  // ---- 矩阵工具 ----
+  function rotX(a) { const c = Math.cos(a), s = Math.sin(a); return [1,0,0, 0,c,-s, 0,s,c]; }
+  function rotY(a) { const c = Math.cos(a), s = Math.sin(a); return [c,0,s, 0,1,0, -s,0,c]; }
+  function mul(A, B) {
+    const o = new Array(9);
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++)
+      o[r*3+c] = A[r*3]*B[c] + A[r*3+1]*B[3+c] + A[r*3+2]*B[6+c];
+    return o;
+  }
+  // 每隔一段时间做一次正交化,避免累积误差
+  function orthonormalize(M) {
+    let [a,b,c, d,e,f, g,h,i] = M;
+    let n = Math.hypot(a,b,c); a/=n; b/=n; c/=n;
+    let dot = a*d+b*e+c*f; d-=dot*a; e-=dot*b; f-=dot*c;
+    n = Math.hypot(d,e,f); d/=n; e/=n; f/=n;
+    g = b*f - c*e; h = c*d - a*f; i = a*e - b*d;
+    return [a,b,c, d,e,f, g,h,i];
+  }
+
+  // ---- 几何数据 ----
+  const grid = [];   // 线段 [x1,y1,z1,x2,y2,z2,kind]
+  const stars = [];  // 点 [x,y,z]
+  (function build() {
+    const MER = 16, PAR = 11, SEG = 72;
+    for (let m = 0; m < MER; m++) {
+      const lon = m / MER * Math.PI * 2;
+      for (let s = 0; s < SEG; s++) {
+        const a = -Math.PI/2 + s / SEG * Math.PI, b = -Math.PI/2 + (s+1) / SEG * Math.PI;
+        grid.push([...sph(a, lon), ...sph(b, lon), 0]);
+      }
+    }
+    for (let p = 1; p <= PAR; p++) {
+      const lat = -Math.PI/2 + p / (PAR + 1) * Math.PI;
+      const kind = p === (PAR + 1) / 2 ? 1 : 0;   // 赤道加亮
+      for (let s = 0; s < SEG * 2; s++) {
+        const a = s / (SEG*2) * Math.PI * 2, b = (s+1) / (SEG*2) * Math.PI * 2;
+        grid.push([...sph(lat, a), ...sph(lat, b), kind]);
+      }
+    }
+    // 斐波那契球面均匀点
+    const N = 700, ga = Math.PI * (3 - Math.sqrt(5));
+    for (let k = 0; k < N; k++) {
+      const y = 1 - (k + .5) / N * 2, r = Math.sqrt(1 - y*y), t = k * ga;
+      stars.push([Math.cos(t) * r, y, Math.sin(t) * r]);
+    }
+  })();
+  function sph(lat, lon) {
+    const c = Math.cos(lat);
+    return [c * Math.cos(lon), Math.sin(lat), c * Math.sin(lon)];
+  }
+  const POLES = [[0,1,0,'#ff6b6b'], [0,-1,0,'#4dabf7']];
+
+  // ---- 投影 ----
+  const CAM = 3.2;
+  function project(x, y, z, rad, cx, cy) {
+    const t = rad * (CAM / (CAM - z)) ;
+    return [cx + x * t, cy - y * t, z];
+  }
+  function xf(x, y, z) {
+    return [R[0]*x + R[1]*y + R[2]*z, R[3]*x + R[4]*y + R[5]*z, R[6]*x + R[7]*y + R[8]*z];
+  }
+
+  // ---- 绘制 ----
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    const cx = W / 2, cy = H / 2 - 10;
+    const rad = Math.min(W, H) * 0.3 * zoom;
+
+    // 光晕
+    const glow = ctx.createRadialGradient(cx, cy, rad * .6, cx, cy, rad * 1.9);
+    glow.addColorStop(0, 'rgba(47,129,247,.22)');
+    glow.addColorStop(1, 'rgba(47,129,247,0)');
+    ctx.fillStyle = glow; ctx.fillRect(0, 0, W, H);
+
+    // 球体底色(带高光,随视角固定光源)
+    const body = ctx.createRadialGradient(cx - rad*.35, cy - rad*.4, rad*.1, cx, cy, rad * 1.02);
+    body.addColorStop(0, '#26364f');
+    body.addColorStop(.6, '#131c2b');
+    body.addColorStop(1, '#0a0f18');
+    ctx.fillStyle = body;
+    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill();
+
+    const items = [];
+
+    if (showGrid) {
+      for (const g of grid) {
+        const a = xf(g[0], g[1], g[2]), b = xf(g[3], g[4], g[5]);
+        items.push({ t: 0, z: (a[2] + b[2]) / 2, a, b, kind: g[6] });
+      }
+    }
+    if (showDots) {
+      for (const s of stars) {
+        const p = xf(s[0] * 1.0, s[1], s[2]);
+        items.push({ t: 1, z: p[2], a: p });
+      }
+    }
+    for (const p of POLES) {
+      const q = xf(p[0] * 1.08, p[1] * 1.08, p[2] * 1.08);
+      items.push({ t: 2, z: q[2], a: q, color: p[3] });
+    }
+    items.sort((u, v) => u.z - v.z);
+
+    ctx.lineCap = 'round';
+    for (const it of items) {
+      const depth = (it.z + 1) / 2;            // 0(后) → 1(前)
+      if (it.t === 0) {
+        const p = project(...it.a, rad, cx, cy), q = project(...it.b, rad, cx, cy);
+        const alpha = it.z > -0.02 ? 0.25 + depth * 0.6 : 0.05 + depth * 0.18;
+        ctx.strokeStyle = it.kind
+          ? `rgba(255,196,87,${Math.min(1, alpha + .15)})`
+          : `rgba(120,180,255,${alpha})`;
+        ctx.lineWidth = it.kind ? 1.6 : (it.z > 0 ? 1.1 : 0.7);
+        ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+      } else if (it.t === 1) {
+        const p = project(...it.a, rad, cx, cy);
+        const front = it.z > 0;
+        ctx.fillStyle = front ? `rgba(255,255,255,${0.3 + depth * 0.7})` : `rgba(160,200,255,${0.08 + depth * 0.2})`;
+        const r = (front ? 1.2 : 0.8) + depth * 1.3;
+        ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, Math.PI * 2); ctx.fill();
+      } else {
+        const p = project(...it.a, rad, cx, cy);
+        ctx.globalAlpha = it.z > 0 ? 1 : 0.35;
+        ctx.fillStyle = it.color;
+        ctx.beginPath(); ctx.arc(p[0], p[1], 5 + depth * 3, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // 边缘轮廓
+    ctx.strokeStyle = 'rgba(140,190,255,.45)'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  // ---- 动画循环 ----
+  let frame = 0;
+  function tick() {
+    if (!dragging) {
+      if (Math.abs(vx) > 1e-4 || Math.abs(vy) > 1e-4) {
+        R = mul(mul(rotX(vy), rotY(vx)), R);
+        vx *= 0.95; vy *= 0.95;
+      } else if (autoSpin) {
+        R = mul(rotY(0.005), R);
+      }
+    }
+    if (++frame % 120 === 0) R = orthonormalize(R);
+    draw();
+    requestAnimationFrame(tick);
+  }
+
+  // ---- 交互 ----
+  const K = 0.0065;   // 像素 → 弧度
+  function applyDrag(dx, dy) {
+    const ry = dx * K, rx = dy * K;
+    R = mul(mul(rotX(rx), rotY(ry)), R);
+    vx = ry; vy = rx;
+  }
+
+  cv.addEventListener('pointerdown', e => {
+    cv.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    if (pointers.size === 1) {
+      dragging = true; lastX = e.clientX; lastY = e.clientY; vx = vy = 0;
+      cv.classList.add('drag');
+    } else if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      pinchDist = Math.hypot(a[0]-b[0], a[1]-b[1]);
+      dragging = false;
+    }
+  });
+  cv.addEventListener('pointermove', e => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      const d = Math.hypot(a[0]-b[0], a[1]-b[1]);
+      if (pinchDist) zoom = clamp(zoom * d / pinchDist, .4, 2.6);
+      pinchDist = d;
+    } else if (dragging) {
+      applyDrag(e.clientX - lastX, e.clientY - lastY);
+      lastX = e.clientX; lastY = e.clientY;
+    }
+  });
+  const end = e => {
+    pointers.delete(e.pointerId);
+    if (pointers.size === 0) { dragging = false; cv.classList.remove('drag'); }
+    if (pointers.size === 1) {
+      const [p] = [...pointers.values()];
+      dragging = true; lastX = p[0]; lastY = p[1]; pinchDist = 0;
+    }
+  };
+  cv.addEventListener('pointerup', end);
+  cv.addEventListener('pointercancel', end);
+  cv.addEventListener('wheel', e => {
+    e.preventDefault();
+    zoom = clamp(zoom * Math.exp(-e.deltaY * 0.0012), .4, 2.6);
+  }, { passive: false });
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+  // ---- 按钮 ----
+  const bind = (id, fn) => document.getElementById(id).addEventListener('click', fn);
+  const toggle = (id, get, set) => bind(id, e => {
+    set(!get()); e.currentTarget.classList.toggle('on', get());
+  });
+  toggle('auto', () => autoSpin, v => autoSpin = v);
+  toggle('grid', () => showGrid, v => showGrid = v);
+  toggle('dots', () => showDots, v => showDots = v);
+  bind('reset', () => { R = rotX(-0.35); zoom = 1; vx = vy = 0; });
+
+  window.addEventListener('resize', resize);
+  resize();
+  tick();
+})();
+</script>
+</body>
+</html>

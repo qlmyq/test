@@ -4,9 +4,12 @@
 
 ## 简介
 
-一个单文件网页版扫雷,无需安装任何依赖。
+一组单文件网页小项目,无需安装任何依赖,用浏览器直接打开即可:
 
-## 玩法
+- `index.html`:扫雷
+- `sphere.html`:可拖动旋转的 3D 球体
+
+## 扫雷玩法
 
 - 左键翻开格子,右键插旗(手机上长按,或点“插旗模式”)
 - 点击已翻开的数字,若周围旗数正确,会自动翻开剩余格子
@@ -18,14 +21,15 @@
 ```bash
 git clone https://github.com/qlmyq/test.git
 cd test
-# 直接用浏览器打开 index.html 即可
+# 用浏览器打开 index.html(扫雷)或 sphere.html(3D 球体)
 ```
 
 ## 目录结构
 
 ```
 test/
-├── index.html   # 扫雷(HTML + CSS + JS)
+├── index.html   # 扫雷
+├── sphere.html  # 可旋转拖动的 3D 球体
 └── README.md
 ```
 
