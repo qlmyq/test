@@ -28,6 +28,7 @@
 <canvas id="c"></canvas>
 <div class="hint">拖动旋转视角 · 滚轮 / 双指缩放 · 松手后带惯性</div>
 <div class="ui">
+  <button id="tex" class="on">贴图</button>
   <button id="auto" class="on">自转</button>
   <button id="orbit" class="on">轨道</button>
   <button id="clouds" class="on">云层</button>
@@ -173,7 +174,7 @@
   let R = VIEW0.slice();          // 视角旋转(拖动改变)
   let zoom = 1;
   let vx = 0, vy = 0;             // 惯性
-  let autoSpin = true, showOrbit = true, showClouds = true;
+  let autoSpin = true, showOrbit = true, showClouds = true, showTex = true;
   let spin = 0, cloudShift = 0, satT = 0.6;
   let dragging = false, lastX = 0, lastY = 0;
   const pointers = new Map();
@@ -230,10 +231,11 @@
   }
 
   const INV_TAU = 1 / TAU, INV_PI = 1 / PI;
+  const GSTEP = PI / 12, GINV = 12 / PI;   // 网格间隔 15°
   function renderPlanet(M) {
     const d = imgData, tx = tex, cm = cloudMap;
     const m0 = M[0], m1 = M[1], m2 = M[2], m3 = M[3], m4 = M[4], m5 = M[5], m6 = M[6], m7 = M[7], m8 = M[8];
-    const cs = cloudShift * TW, withClouds = showClouds;
+    const cs = cloudShift * TW, withClouds = showClouds, pw = 1 / rpx;
     for (let k = 0; k < count; k++) {
       const nx = pnx[k], ny = pny[k], nz = pnz[k];
       const dx = m0*nx + m1*ny + m2*nz;
@@ -241,6 +243,21 @@
       const dz = m6*nx + m7*ny + m8*nz;
       dy = dy < -1 ? -1 : dy > 1 ? 1 : dy;
       const lat = Math.asin(dy), lon = Math.atan2(dz, dx);
+      if (!showTex) {
+        const fl = lat * GINV, fo = lon * GINV;
+        const dl = Math.abs(fl - Math.round(fl)) * GSTEP;
+        const dn = Math.abs(fo - Math.round(fo)) * GSTEP * Math.sqrt(1 - dy * dy);
+        const dd = dl < dn ? dl : dn;
+        let t = (dd - 0.4 * pw) / pw; t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const ln = (1 - t * t * (3 - 2 * t)) * 0.8;
+        const pr = 92 + (205 - 92) * ln, pg = 128 + (225 - 128) * ln, pb = 176 + (255 - 176) * ln;
+        const light0 = plight[k], rim0 = prim[k], sp0 = pspec[k] * 110, o0 = pidx[k];
+        d[o0]     = pr * light0 + sp0 + rim0 * 70;
+        d[o0 + 1] = pg * light0 + sp0 + rim0 * 130;
+        d[o0 + 2] = pb * light0 + sp0 + rim0 * 230;
+        d[o0 + 3] = palpha[k];
+        continue;
+      }
       const fu = (lon * INV_TAU + 0.5) * TW - 0.5;
       const fv = (0.5 - lat * INV_PI) * TH - 0.5;
 
@@ -538,6 +555,10 @@
 
   const bind = (id, fn) => document.getElementById(id).addEventListener('click', fn);
   const toggle = (id, get, set) => bind(id, e => { set(!get()); e.currentTarget.classList.toggle('on', get()); });
+  toggle('tex', () => showTex, v => {
+    showTex = v;
+    document.getElementById('clouds').style.opacity = v ? '' : '0.4';   // 无贴图时云层不显示
+  });
   toggle('auto', () => autoSpin, v => autoSpin = v);
   toggle('orbit', () => showOrbit, v => showOrbit = v);
   toggle('clouds', () => showClouds, v => showClouds = v);
